@@ -654,9 +654,34 @@ fn document_symbols_for(server: &mut Server, uri: &Url) -> Vec<DocumentSymbol> {
         if !sym {
             continue;
         }
-        let (line_s, char_s) =
+        let (sel_line_s, sel_char_s) =
             canc_core::scan::byte_to_lsp(&src, anchor.range.start);
-        let (line_e, char_e) = canc_core::scan::byte_to_lsp(&src, anchor.range.end);
+        let (sel_line_e, sel_char_e) =
+            canc_core::scan::byte_to_lsp(&src, anchor.range.end);
+        let selection_range = Range {
+            start: Position {
+                line: sel_line_s,
+                character: sel_char_s,
+            },
+            end: Position {
+                line: sel_line_e,
+                character: sel_char_e,
+            },
+        };
+        // Use the full source line as the symbol range so Zed's outline
+        // enrichment/highlighting can match the tag name against buffer text
+        // reliably (selectionRange stays on the tag span). Anchors are
+        // single-line comment tags in practice.
+        let line_start_byte = src[..anchor.range.start]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let line_end_byte = src[anchor.range.end..]
+            .find('\n')
+            .map(|i| anchor.range.end + i)
+            .unwrap_or(src.len());
+        let (line_s, char_s) = canc_core::scan::byte_to_lsp(&src, line_start_byte);
+        let (line_e, char_e) = canc_core::scan::byte_to_lsp(&src, line_end_byte);
         let range = Range {
             start: Position {
                 line: line_s,
@@ -683,7 +708,7 @@ fn document_symbols_for(server: &mut Server, uri: &Url) -> Vec<DocumentSymbol> {
             tags: None,
             deprecated: None,
             range,
-            selection_range: range,
+            selection_range,
             children: None,
         });
     }
