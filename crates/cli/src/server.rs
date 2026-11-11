@@ -4,6 +4,8 @@ use lsp_types::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::log;
+
 struct Server {
     /// Explicit config passed via initialization options `configPath`
     /// (used when a document has no file path or no on-disk config).
@@ -23,11 +25,6 @@ struct Server {
     docs: HashMap<Url, String>,
     doc_paths: HashMap<Url, PathBuf>,
     workspace_roots: Vec<PathBuf>,
-    /// Counter for `workspace/semanticTokens/refresh` request ids this
-    /// server sends to the client. Formatted as `canc-refresh-<n>` so
-    /// these ids never collide with numeric ids the client uses for its
-    /// own requests on the same connection.
-    next_refresh_id: u32,
 }
 
 /// Build the modifier legend: every configured tag class in config order
@@ -216,7 +213,6 @@ pub fn run() {
         docs: HashMap::new(),
         doc_paths: HashMap::new(),
         workspace_roots,
-        next_refresh_id: 0,
     };
 
     for msg in connection.receiver.iter() {
@@ -268,6 +264,7 @@ fn handle_request(conn: &Connection, server: &mut Server, req: Request) {
                 partial_result_params: Default::default(),
             });
         let tokens = semantic_tokens_for(server, &params.text_document.uri);
+        log::debug(&format!("semanticTokens/full uri={} tokens={}", params.text_document.uri, tokens.len()));
         let result = SemanticTokensResult::Tokens(SemanticTokens {
             data: tokens,
             result_id: None,
@@ -284,6 +281,7 @@ fn handle_request(conn: &Connection, server: &mut Server, req: Request) {
                 partial_result_params: Default::default(),
             });
         let symbols = workspace_symbols(server, &params.query);
+        log::debug(&format!("workspace/symbol query={:?} results={}", params.query, symbols.len()));
         let result = WorkspaceSymbolResponse::Flat(symbols);
         let resp = lsp_server::Response::new_ok(req.id, result);
         let _ = conn.sender.send(Message::Response(resp));
@@ -299,6 +297,7 @@ fn handle_request(conn: &Connection, server: &mut Server, req: Request) {
                 partial_result_params: Default::default(),
             });
         let symbols = document_symbols_for(server, &params.text_document.uri);
+        log::debug(&format!("documentSymbol uri={} symbols={}", params.text_document.uri, symbols.len()));
         let result = DocumentSymbolResponse::Nested(symbols);
         let resp = lsp_server::Response::new_ok(req.id, result);
         let _ = conn.sender.send(Message::Response(resp));
@@ -354,7 +353,12 @@ fn handle_notification(conn: &Connection, server: &mut Server, notif: lsp_server
         }
         server.docs.insert(uri.clone(), params.text_document.text);
         publish_diagnostics(conn, server, &uri);
-        send_semantic_refresh(conn, server);
+        // Intentionally no workspace/semanticTokens/refresh: in Zed's
+        // multi-server "combined" mode a refresh bumps the generation and
+        // forces re-decoding of *all* servers' cached raw tokens against the
+        // current snapshot. If another server (e.g. clangd) has stale raw
+        // positions, re-decoding them misaligns highlights (intra-word
+        // splits). Zed re-requests tokens on its own edit/debounce cycle.
         return;
     }
     if notif.method == "textDocument/didChange" {
@@ -393,9 +397,11 @@ fn handle_notification(conn: &Connection, server: &mut Server, notif: lsp_server
             updated = Some(last.text.clone());
         }
         if let Some(text) = updated {
+            log::debug(&format!("didChange uri={} bytes={}", uri, text.len()));
             server.docs.insert(uri.clone(), text);
             publish_diagnostics(conn, server, &uri);
-            send_semantic_refresh(conn, server);
+            // No workspace/semanticTokens/refresh: see didOpen comment.
+            // Zed's pull-based refresh picks up our changed tokens.
         }
         return;
     }
@@ -406,40 +412,24 @@ fn handle_notification(conn: &Connection, server: &mut Server, notif: lsp_server
                     uri: Url::parse("file:///tmp").unwrap(),
                 },
             });
+        log::debug(&format!("didClose uri={}", params.text_document.uri));
         server.docs.remove(&params.text_document.uri);
+        server.doc_paths.remove(&params.text_document.uri);
         publish_diagnostics_empty(conn, &params.text_document.uri);
         return;
     }
     if notif.method == "workspace/didChangeConfiguration" {
         // Configs may have changed on disk and/or per-root settings; drop the
         // per-directory cache and re-resolve on the next use.
+        log::info("workspace/didChangeConfiguration: clearing config cache");
         server.config_cache.clear();
         let uris: Vec<Url> = server.docs.keys().cloned().collect();
         for uri in uris {
             publish_diagnostics(conn, server, &uri);
+            // No refresh push; Zed will re-request on next cycle.
         }
         return;
     }
-}
-
-/// Send a `workspace/semanticTokens/refresh` request to the client so it
-/// re-requests semantic tokens instead of leaving highlights anchored to
-/// pre-edit positions. Per the LSP spec a server MAY send this at any
-/// time; it is sent once per didOpen/didChange notification that changed
-/// text (not once per content-change chunk). Some clients may reply with
-/// a MethodNotFound error — that Response is tolerated silently by the
-/// main loop's `Message::Response(_) => {}` arm.
-/// Request ids use a string namespace so they cannot collide with the
-/// numeric ids clients use for their own requests on the same pipe.
-fn send_semantic_refresh(conn: &Connection, server: &mut Server) {
-    server.next_refresh_id = server.next_refresh_id.wrapping_add(1);
-    let id = lsp_server::RequestId::from(format!("canc-refresh-{}", server.next_refresh_id));
-    let req = lsp_server::Request {
-        id,
-        method: "workspace/semanticTokens/refresh".into(),
-        params: serde_json::Value::Null,
-    };
-    let _ = conn.sender.send(Message::Request(req));
 }
 
 fn lang_for_doc(server: &Server, uri: &Url) -> Lang {
@@ -514,6 +504,7 @@ fn publish_diagnostics(conn: &Connection, server: &mut Server, uri: &Url) {
             ..Default::default()
         });
     }
+    log::debug(&format!("publishDiagnostics uri={} count={}", uri, diags.len()));
     let notif = lsp_server::Notification {
         method: "textDocument/publishDiagnostics".into(),
         params: serde_json::to_value(PublishDiagnosticsParams {

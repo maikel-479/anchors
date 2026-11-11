@@ -1,5 +1,6 @@
 mod anchors;
 mod config_cmd;
+mod log;
 mod server;
 mod init_zed;
 
@@ -58,6 +59,7 @@ enum ConfigAction {
 }
 
 fn main() {
+    log::init();
     let cli = Cli::parse();
     match cli.command {
         // `serve` is the default when invoked with no arguments — Zed may

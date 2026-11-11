@@ -26,8 +26,8 @@ struct TestClient {
     stdin: std::process::ChildStdin,
     rx: Receiver<Value>,
     next_id: i64,
+    diagnostics_count: usize,
     refresh_count: usize,
-    refresh_methods: Vec<String>,
     _root_dir: PathBuf,
     uri: String,
 }
@@ -98,8 +98,8 @@ impl TestClient {
             stdin,
             rx,
             next_id: 1,
+            diagnostics_count: 0,
             refresh_count: 0,
-            refresh_methods: Vec::new(),
             _root_dir: root_dir,
             uri,
         };
@@ -125,12 +125,16 @@ impl TestClient {
             if method == "workspace/semanticTokens/refresh" {
                 self.refresh_count += 1;
             }
-            self.refresh_methods.push(method.clone());
-            let _ = method;
             let resp = json!({"jsonrpc": "2.0", "id": id, "result": null});
             self.send(resp);
+            return;
         }
-        // Notifications (publishDiagnostics etc.) are ignored.
+        // Server -> client notification.
+        if let Some(method) = msg.get("method").and_then(|m| m.as_str()) {
+            if method == "textDocument/publishDiagnostics" {
+                self.diagnostics_count += 1;
+            }
+        }
     }
 
     fn recv_response(&mut self, expect_id: i64) -> Value {
@@ -142,15 +146,10 @@ impl TestClient {
                             return msg;
                         }
                     }
-                    // Request or unrelated response/notification: handle or ignore.
-                    if msg.get("method").is_some() && msg.get("id").is_some() {
-                        self.handle_incoming(msg);
-                        continue;
-                    }
+                    // Server->client request or notification, or unrelated response.
                     if msg.get("method").is_some() {
-                        continue; // notification
+                        self.handle_incoming(msg);
                     }
-                    // Other response (e.g. to our refresh? we don't send those).
                     continue;
                 }
                 Err(RecvTimeoutError::Timeout) => panic!("timeout waiting for response id {expect_id}"),
@@ -181,8 +180,8 @@ impl TestClient {
         self.send_notification("initialized", json!({}));
     }
 
-    fn did_open(&mut self, text: &str) -> usize {
-        let before = self.refresh_count;
+    fn did_open(&mut self, text: &str) {
+        let before = self.diagnostics_count;
         self.send_notification(
             "textDocument/didOpen",
             json!({
@@ -194,12 +193,11 @@ impl TestClient {
                 }
             }),
         );
-        self.wait_refresh(before);
-        self.refresh_count
+        self.wait_for_diagnostics(before);
     }
 
     fn did_change_full(&mut self, text: &str) {
-        let before = self.refresh_count;
+        let before = self.diagnostics_count;
         self.send_notification(
             "textDocument/didChange",
             json!({
@@ -207,11 +205,11 @@ impl TestClient {
                 "contentChanges": [{"text": text}]
             }),
         );
-        self.wait_refresh(before);
+        self.wait_for_diagnostics(before);
     }
 
     fn did_change_incremental(&mut self, changes: Value) {
-        let before = self.refresh_count;
+        let before = self.diagnostics_count;
         self.send_notification(
             "textDocument/didChange",
             json!({
@@ -219,31 +217,34 @@ impl TestClient {
                 "contentChanges": changes
             }),
         );
-        self.wait_refresh(before);
+        self.wait_for_diagnostics(before);
     }
 
-    /// After a text-change notification the server should have sent one
-    /// workspace/semanticTokens/refresh request. Wait briefly for it so
-    /// the response is consumed before the next request (and count it).
-    fn wait_refresh(&mut self, before: usize) {
+    /// Wait for the server to process a text-change notification.
+    /// The server always publishes diagnostics after didOpen/didChange,
+    /// so a diagnostics notification is a reliable processing barrier.
+    fn wait_for_diagnostics(&mut self, before: usize) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            if self.refresh_count > before {
+            if self.diagnostics_count > before {
                 return;
             }
             match self.rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(msg) => {
-                    if msg.get("method").is_some() && msg.get("id").is_some() {
+                    if msg.get("method").is_some() {
                         self.handle_incoming(msg);
                     }
-                    // drain notifications silently
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => panic!("server closed stdout while waiting refresh"),
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("server closed stdout while waiting for diagnostics")
+                }
             }
         }
-        // Older builds (or a server that doesn't send refresh) would hit
-        // this; the assertions below check the count to be explicit.
+        panic!(
+            "timed out waiting for publishDiagnostics (before={before}, now={})",
+            self.diagnostics_count
+        );
     }
 
     fn semantic_tokens(&mut self) -> Vec<(u32, u32, u32, u32)> {
@@ -348,15 +349,11 @@ const DEDENTED: &str = "let x = 1; // TODO: inline todo after code\n/* NOTE: **b
 fn full_dedent_5tabs_keeps_offsets_correct() {
     let mut client = TestClient::spawn("full");
     client.did_open(INDENTED);
-    let after_open = client.refresh_count;
-    assert!(after_open >= 1, "server should send workspace/semanticTokens/refresh after didOpen");
 
     let before = client.semantic_tokens();
     assert_tokens_match_text(&before, INDENTED, "initial (indented)");
 
     client.did_change_full(DEDENTED);
-    // Refresh is now sent after didChange; the client would re-request.
-    // Here we request explicitly and assert freshness regardless.
     let after = client.semantic_tokens();
     assert_tokens_match_text(&after, DEDENTED, "after FULL didChange dedent");
 
@@ -443,20 +440,33 @@ fn insert_before_tags_shifts_tokens_exactly() {
 }
 
 #[test]
-fn refresh_sent_after_every_text_change() {
+fn no_workspace_semantic_tokens_refresh_spam() {
+    // workspace/semanticTokens/refresh forces Zed to re-decode ALL servers'
+    // cached raw tokens against the current snapshot. A secondary server
+    // doing this on every edit can misalign a primary server's (e.g. clangd)
+    // highlights if its raw data is for an older buffer state. The server
+    // must not push refresh; Zed re-requests tokens via its own pull cycle.
     let mut client = TestClient::spawn("refresh");
-    let c0 = client.refresh_count;
     client.did_open(INDENTED);
-    assert!(client.refresh_count > c0, "no workspace/semanticTokens/refresh after didOpen");
-    for m in &client.refresh_methods {
-        assert_eq!(m, "workspace/semanticTokens/refresh", "unexpected server->client method");
-    }
-    let c1 = client.refresh_count;
     client.did_change_full(DEDENTED);
-    assert!(client.refresh_count > c1, "no workspace/semanticTokens/refresh after didChange (FULL)");
-    let c2 = client.refresh_count;
     client.did_change_incremental(json!([
         {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}, "text": " "}
     ]));
-    assert!(client.refresh_count > c2, "no workspace/semanticTokens/refresh after didChange (incremental)");
+    // Drain any stray server->client requests briefly.
+    let deadline = std::time::Instant::now() + Duration::from_millis(300);
+    while std::time::Instant::now() < deadline {
+        match client.rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(msg) => {
+                if msg.get("method").is_some() {
+                    client.handle_incoming(msg);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    assert_eq!(
+        client.refresh_count, 0,
+        "server must not send workspace/semanticTokens/refresh"
+    );
 }
