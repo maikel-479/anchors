@@ -6,8 +6,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Zed extension for Anchors (canc): locates the LSP server binary and provides the comment-language grammar."
 license = "MIT"
-repository = "https://github.com/maikel-479/Anchors"
-homepage = "https://github.com/maikel-479/Anchors"
+repository = "https://github.com/maikel-479/anchors"
+homepage = "https://github.com/maikel-479/anchors"
 keywords = ["zed", "lsp", "comment", "annotations"]
 categories = ["development-tools"]
 
